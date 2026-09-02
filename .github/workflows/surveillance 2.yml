@@ -1,0 +1,142 @@
+name: Surveillance Pass Housewives
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: surveillance-pass-housewives
+  cancel-in-progress: true
+
+jobs:
+  verifier:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer Beautiful Soup
+        run: pip install beautifulsoup4
+
+      - name: Vérifier le Pass Housewives et envoyer l'alerte
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: |
+          python <<'PY'
+          import os
+          import re
+          import smtplib
+          import ssl
+          from email.message import EmailMessage
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+
+          SHOP_URL = (
+              "https://www.billetweb.fr/shop.php?event=the-desperate-con-2"
+              "&color=no&page=1&margin=margin_small&ref=the-desperate-con-2"
+          )
+          PUBLIC_URL = "https://www.billetweb.fr/the-desperate-con-2"
+          STATE_FILE = Path("state.txt")
+
+          request = Request(
+              SHOP_URL,
+              headers={
+                  "User-Agent": (
+                      "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+                      "AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
+                  ),
+                  "Accept-Language": "fr-FR,fr;q=0.9",
+              },
+          )
+          with urlopen(request, timeout=30) as response:
+              html = response.read().decode("utf-8", errors="replace")
+
+          from bs4 import BeautifulSoup
+
+          soup = BeautifulSoup(html, "html.parser")
+          sold_words = re.compile(
+              r"\b(complet|complète|épuisé|épuisée|indisponible|sold\s*out)\b",
+              re.IGNORECASE,
+          )
+          target_rows = [
+              row
+              for row in soup.find_all("tr")
+              if re.search(
+                  r"\bPass\s*-\s*Housewives\b",
+                  " ".join(row.stripped_strings),
+                  re.IGNORECASE,
+              )
+          ]
+          if len(target_rows) != 1:
+              raise RuntimeError(
+                  f"Nombre inattendu de lignes Pass Housewives : {len(target_rows)}."
+              )
+
+          container = target_rows[0]
+          ticket_text = " ".join(container.stripped_strings)
+          sold_out = bool(sold_words.search(ticket_text))
+          enabled_quantity = any(
+              not element.has_attr("disabled")
+              and any(
+                  option.get("value", option.get_text(strip=True)) not in {"", "0"}
+                  for option in element.find_all("option")
+              )
+              for element in container.find_all("select")
+          )
+          available = not sold_out and enabled_quantity
+
+          previous_state = (
+              STATE_FILE.read_text(encoding="utf-8").strip()
+              if STATE_FILE.exists()
+              else "unknown"
+          )
+          new_state = "available" if available else "unavailable"
+
+          if available and previous_state != "available":
+              gmail_address = os.environ.get("GMAIL_ADDRESS", "").strip()
+              app_password = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "")
+              if not gmail_address or not app_password:
+                  raise RuntimeError("Les secrets Gmail ne sont pas encore configurés.")
+
+              message = EmailMessage()
+              message["Subject"] = "URGENT — Pass Housewives disponible"
+              message["From"] = gmail_address
+              message["To"] = gmail_address
+              message.set_content(
+                  "Une place Pass Housewives semble à nouveau réellement sélectionnable "
+                  "sur la billetterie officielle Billetweb.\n\n"
+                  f"Lien officiel : {PUBLIC_URL}\n\n"
+                  "Ouvrez immédiatement le lien pour vérifier et réserver."
+              )
+              with smtplib.SMTP_SSL(
+                  "smtp.gmail.com", 465, context=ssl.create_default_context()
+              ) as server:
+                  server.login(gmail_address, app_password)
+                  server.send_message(message)
+              print("Alerte Gmail envoyée.")
+          else:
+              print(f"État : {new_state}. Aucun e-mail envoyé.")
+
+          STATE_FILE.write_text(new_state + "\n", encoding="utf-8")
+          PY
+
+      - name: Mémoriser le dernier état
+        run: |
+          git config user.name "Surveillance Billetweb"
+          git config user.email "actions@github.com"
+          git add state.txt
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "Mise à jour de l'état du Pass Housewives"
+          git push
